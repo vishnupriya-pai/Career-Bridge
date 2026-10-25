@@ -1,0 +1,76 @@
+create extension if not exists pgcrypto;
+create schema if not exists private;
+revoke all on schema private from public, anon, authenticated;
+grant usage on schema private to authenticated;
+create table public.profiles (id uuid primary key references auth.users(id) on delete cascade,email text not null,full_name text not null default '',phone text,headline text,location text,experience text not null default 'Fresher',skills text[] not null default '{}',role text not null default 'candidate' check (role in ('candidate','coordinator','admin')),created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create table public.jobs (id uuid primary key default gen_random_uuid(),title text not null check(length(title) between 2 and 160),company text not null check(length(company) between 1 and 120),location text not null default 'India',type text not null default 'Full-time',experience text not null default 'Fresher',salary text,description text not null default '',skills text[] not null default '{}',kind text not null default 'job' check(kind in ('job','referral')),status text not null default 'pending' check(status in ('active','pending','closed')),coordinator_id uuid references public.profiles(id) on delete set null,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create table public.saved_jobs (user_id uuid not null references public.profiles(id) on delete cascade,job_id uuid not null references public.jobs(id) on delete cascade,created_at timestamptz not null default now(),primary key(user_id,job_id));
+create table public.applications (id uuid primary key default gen_random_uuid(),user_id uuid not null references public.profiles(id) on delete cascade,job_id uuid not null references public.jobs(id) on delete cascade,status text not null default 'submitted' check(status in ('submitted','reviewing','interview','rejected','offer')),created_at timestamptz not null default now(),unique(user_id,job_id));
+create table public.referral_requests (id uuid primary key default gen_random_uuid(),user_id uuid not null references public.profiles(id) on delete cascade,job_id uuid not null references public.jobs(id) on delete cascade,message text not null check(length(message) between 2 and 3000),status text not null default 'pending' check(status in ('pending','accepted','declined','completed')),created_at timestamptz not null default now(),unique(user_id,job_id));
+create table public.payment_orders (id uuid primary key default gen_random_uuid(),user_id uuid not null references public.profiles(id) on delete cascade,provider text not null check(provider in ('razorpay','stripe')),provider_order_id text unique,amount_paise bigint not null check(amount_paise>0),currency text not null default 'INR',status text not null default 'created' check(status in ('created','paid','failed','refunded')),created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create table public.notification_log (id uuid primary key default gen_random_uuid(),user_id uuid not null references public.profiles(id) on delete cascade,channel text not null check(channel in ('email','sms','whatsapp')),created_at timestamptz not null default now());
+create index jobs_status_created_idx on public.jobs(status,created_at desc);
+create index jobs_search_idx on public.jobs using gin(to_tsvector('english',title||' '||company||' '||location||' '||description));
+create index referral_requests_job_idx on public.referral_requests(job_id,status);
+create index applications_user_created_idx on public.applications(user_id,created_at desc);
+create or replace function private.is_admin() returns boolean language sql stable set search_path = '' as $$ select coalesce((auth.jwt()->'app_metadata'->>'role')='admin',false) $$;
+create or replace function private.is_coordinator() returns boolean language sql stable set search_path = '' as $$ select coalesce((auth.jwt()->'app_metadata'->>'role') in ('coordinator','admin'),false) $$;
+create or replace function private.touch_updated_at() returns trigger language plpgsql set search_path='' as $$ begin new.updated_at=now(); return new; end $$;
+create or replace function private.handle_new_user() returns trigger language plpgsql security definer set search_path='' as $$ begin insert into public.profiles(id,email,full_name,role) values(new.id,new.email,coalesce(new.raw_user_meta_data->>'full_name',''),'candidate') on conflict(id) do nothing; return new; end $$;
+revoke all on function private.is_admin() from public,anon;
+revoke all on function private.is_coordinator() from public,anon;
+revoke all on function private.touch_updated_at() from public,anon,authenticated;
+revoke all on function private.handle_new_user() from public,anon,authenticated;
+create trigger on_auth_user_created after insert on auth.users for each row execute function private.handle_new_user();
+create trigger profiles_touch before update on public.profiles for each row execute function private.touch_updated_at();
+create trigger jobs_touch before update on public.jobs for each row execute function private.touch_updated_at();
+create trigger payment_orders_touch before update on public.payment_orders for each row execute function private.touch_updated_at();
+alter table public.profiles enable row level security;
+alter table public.jobs enable row level security;
+alter table public.saved_jobs enable row level security;
+alter table public.applications enable row level security;
+alter table public.referral_requests enable row level security;
+alter table public.payment_orders enable row level security;
+alter table public.notification_log enable row level security;
+create policy "profiles visible to owner or staff" on public.profiles for select to authenticated using((select auth.uid())=id or (select private.is_admin()));
+create policy "assigned coordinators view referral candidates" on public.profiles for select to authenticated using(exists(select 1 from public.referral_requests r join public.jobs j on j.id=r.job_id where r.user_id=profiles.id and j.coordinator_id=(select auth.uid()) and (select private.is_coordinator())));
+create policy "candidate profile insert only" on public.profiles for insert to authenticated with check((select auth.uid())=id and role='candidate');
+create policy "owner edits own profile" on public.profiles for update to authenticated using((select auth.uid())=id and role='candidate') with check((select auth.uid())=id and role='candidate');
+create policy "admin edits profiles" on public.profiles for update to authenticated using((select private.is_admin())) with check((select private.is_admin()));
+create policy "public reads active jobs" on public.jobs for select to anon using(status='active');
+create policy "authenticated reads active and permitted jobs" on public.jobs for select to authenticated using(status='active' or ((select private.is_coordinator()) and coordinator_id=(select auth.uid())) or (select private.is_admin()));
+create policy "staff create listings" on public.jobs for insert to authenticated with check((select private.is_coordinator()) and coordinator_id=(select auth.uid()));
+create policy "staff edit own listings or admin" on public.jobs for update to authenticated using((coordinator_id=(select auth.uid()) and (select private.is_coordinator())) or (select private.is_admin())) with check((coordinator_id=(select auth.uid()) and (select private.is_coordinator())) or (select private.is_admin()));
+create policy "admin deletes listings" on public.jobs for delete to authenticated using((select private.is_admin()));
+create policy "users read own saves" on public.saved_jobs for select to authenticated using((select auth.uid())=user_id);
+create policy "users save own jobs" on public.saved_jobs for insert to authenticated with check((select auth.uid())=user_id);
+create policy "users remove own saves" on public.saved_jobs for delete to authenticated using((select auth.uid())=user_id);
+create policy "users and staff read applications" on public.applications for select to authenticated using((select auth.uid())=user_id or (select private.is_admin()) or exists(select 1 from public.jobs j where j.id=job_id and j.coordinator_id=(select auth.uid()) and (select private.is_coordinator())));
+create policy "candidate creates own application" on public.applications for insert to authenticated with check((select auth.uid())=user_id and exists(select 1 from public.jobs j where j.id=job_id and j.status='active'));
+create policy "staff updates applications" on public.applications for update to authenticated using((select private.is_admin()) or exists(select 1 from public.jobs j where j.id=job_id and j.coordinator_id=(select auth.uid()) and (select private.is_coordinator()))) with check((select private.is_admin()) or exists(select 1 from public.jobs j where j.id=job_id and j.coordinator_id=(select auth.uid()) and (select private.is_coordinator())));
+create policy "requester and assigned staff read referral" on public.referral_requests for select to authenticated using((select auth.uid())=user_id or (select private.is_admin()) or exists(select 1 from public.jobs j where j.id=job_id and j.coordinator_id=(select auth.uid()) and (select private.is_coordinator())));
+create policy "candidate creates own referral request" on public.referral_requests for insert to authenticated with check((select auth.uid())=user_id and exists(select 1 from public.jobs j where j.id=job_id and j.kind='referral' and j.status='active'));
+create policy "assigned staff updates referral" on public.referral_requests for update to authenticated using((select private.is_admin()) or exists(select 1 from public.jobs j where j.id=job_id and j.coordinator_id=(select auth.uid()) and (select private.is_coordinator()))) with check((select private.is_admin()) or exists(select 1 from public.jobs j where j.id=job_id and j.coordinator_id=(select auth.uid()) and (select private.is_coordinator())));
+create policy "user sees own payment orders" on public.payment_orders for select to authenticated using((select auth.uid())=user_id or (select private.is_admin()));
+grant usage on schema public to anon,authenticated;
+revoke all on public.profiles,public.jobs,public.saved_jobs,public.applications,public.referral_requests,public.payment_orders,public.notification_log from public,anon,authenticated;
+grant select on public.jobs to anon,authenticated;
+grant select,insert,delete on public.profiles to authenticated;
+grant select,insert,update,delete on public.jobs,public.saved_jobs,public.applications,public.referral_requests to authenticated;
+grant select on public.payment_orders to authenticated;
+grant update(full_name,phone,headline,location,experience,skills) on public.profiles to authenticated;
+grant update(title,company,location,type,experience,salary,description,skills,kind,status) on public.jobs to authenticated;
+grant update(status) on public.applications,public.referral_requests to authenticated;
+revoke insert,update,delete on public.payment_orders from anon,authenticated;
+revoke all on public.notification_log from anon,authenticated;
+grant select,update on public.profiles to service_role;
+grant select,insert,update on public.payment_orders,public.notification_log to service_role;
+grant execute on function private.is_admin() to authenticated;
+grant execute on function private.is_coordinator() to authenticated;
+insert into public.jobs(title,company,location,type,experience,salary,description,skills,kind,status) values
+('Associate Product Designer','Linear Labs','Bengaluru, India','Full-time','Fresher','₹6–9 LPA','Help shape thoughtful experiences for a fast-growing product team. Work with design and engineering from discovery through delivery.',array['Figma','Research','Prototyping'],'job','active'),
+('Frontend Engineer','Northstar','Remote · India','Full-time','1–3 years','₹12–18 LPA','Build fast, accessible interfaces with React and TypeScript. Partner with product and design to ship useful features.',array['React','TypeScript','CSS'],'job','active'),
+('Graduate Software Engineer','Atlassian','Bengaluru, India','Full-time','Fresher','₹18–24 LPA','Kickstart your engineering career on collaborative products used by teams around the world.',array['Java','DSA','SQL'],'job','active'),
+('Data Analyst','Razorpay','Bengaluru, India','Full-time','1–2 years','₹10–14 LPA','Turn product and payments data into clear insights that help merchants grow.',array['SQL','Python','Tableau'],'job','active'),
+('SDE I — Employee referral','Google','Hyderabad, India','Full-time','0–2 years','₹20–28 LPA','A warm employee referral opportunity. Share your resume and a short note about your projects.',array['Java','Algorithms','Systems'],'referral','active'),
+('UX Researcher — referral','Microsoft','Remote · India','Full-time','1–3 years','₹16–22 LPA','Looking to refer early-career researchers with strong qualitative research and storytelling skills.',array['Research','Interviews','Figma'],'referral','active');
