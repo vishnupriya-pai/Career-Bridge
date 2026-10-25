@@ -4,7 +4,7 @@
 
 This workspace is connected to the active Supabase project `CareerBridge` (`bsldieqijtlolepkkcpm`, region `ap-south-1`). The schema and row-level security are installed, with 21 active sample listings across fresher, experienced, and referral categories. The `admin-users`, `notify`, `payments`, and `whatsapp-bot` (inactive no-reply handler) Edge Functions are deployed. Local URL and publishable key are stored in the ignored `.env.local`; never commit that file.
 
-A responsive React + TypeScript + Vite job portal for early-career and experienced candidates, plus employee referrals. It includes candidate, coordinator, and administrator workspaces; search and filters; profiles; saved jobs; applications; referral requests; moderation; email verification; messaging adapters; and Razorpay checkout.
+A responsive job portal built with React and JavaScript (JSX), an HTML page shell, plain CSS, and Vite for early-career and experienced candidates, plus employee referrals. It includes candidate, coordinator, and administrator workspaces; search and filters; profiles; saved jobs; applications; referral requests; moderation; email verification; messaging adapters; and Razorpay checkout.
 
 ## Run locally
 
@@ -67,8 +67,8 @@ For a future code update, deploy functions with the Supabase CLI after linking t
 
 ## Architecture and security
 
-- React pages and reusable UI live in `src/App.tsx`; styling is plain responsive CSS in `src/style.css`.
-- `src/lib/data.ts` selects Supabase persistence when credentials are set and browser-local demo storage otherwise.
+- React pages and reusable UI live in `src/App.jsx`; client data and Supabase setup live in `src/lib/*.js`; the page shell is `index.html`; styling is responsive CSS in `src/style.css`. Supabase Edge Functions remain TypeScript server code.
+- `src/lib/data.js` selects Supabase persistence when credentials are set and browser-local demo storage otherwise.
 - `supabase/migrations` defines Postgres constraints, indexes, private role-check helpers, RLS policies, explicit Data API grants, and seed listings.
 - Supabase email/password authentication verifies email. Authorization roles use trusted `app_metadata` claims. Never trust user-editable `user_metadata` for access control.
 - Referral requests and applications are scoped to the owner and assigned coordinator. Profile role edits are not granted to clients. Payment status changes happen only from the signed provider webhook.
