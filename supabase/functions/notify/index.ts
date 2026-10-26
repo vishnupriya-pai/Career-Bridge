@@ -10,7 +10,7 @@ const corsFor = (origin: string | null) => ({
 });
 const reply = (body: unknown, status = 200, origin: string | null = null) =>
   new Response(JSON.stringify(body), { status, headers: { ...corsFor(origin), 'Content-Type': 'application/json' } });
-const normalizePhone = (phone: string | null) => (phone ?? '').replace(/[\\s()-]/g, '');
+const normalizePhone = (phone: string | null) => (phone ?? '').replace(/[\s()-]/g, '');
 
 Deno.serve(async (req) => {
   const origin = req.headers.get('Origin');
@@ -35,13 +35,26 @@ Deno.serve(async (req) => {
   if (eventKey.length > 180 || !/^[a-zA-Z0-9:_-]+$/.test(eventKey)) return reply({ error: 'Invalid notification reference' }, 400, origin);
 
   const admin = createClient(url, service);
-  const { data: profile } = await admin.from('profiles').select('id,email,phone,whatsapp_opt_in,sms_opt_in').eq('id', user.id).maybeSingle();
+  const { data: profile, error: profileError } = await admin.from('profiles').select('id,email,phone,phone_verified,whatsapp_opt_in,sms_opt_in').eq('id', user.id).maybeSingle();
+  if (profileError) {
+    console.error('notify.profile_lookup_failed', { code: profileError.code });
+    return reply({ error: 'Could not read the messaging profile' }, 500, origin);
+  }
   if (!profile) return reply({ error: 'Profile not found' }, 404, origin);
-  if (channel === 'whatsapp' && !profile.whatsapp_opt_in) return reply({ error: 'Enable WhatsApp updates in your profile first' }, 403, origin);
+  const whatsappSandboxMode = (Deno.env.get('TWILIO_WHATSAPP_SANDBOX_MODE') ?? '').trim().toLowerCase() === 'true';
+  if (channel === 'whatsapp' && !profile.whatsapp_opt_in) {
+    console.warn('notify.rejected', { reason: 'whatsapp_opt_in_missing' });
+    return reply({ error: 'Enable WhatsApp updates in your profile, save it, then try again' }, 403, origin);
+  }
+  if (channel === 'whatsapp' && !profile.phone_verified && !whatsappSandboxMode) {
+    console.warn('notify.rejected', { reason: 'phone_not_verified_and_sandbox_disabled' });
+    return reply({ error: 'Verify your phone number with WhatsApp OTP first, or enable sandbox mode for a trial self-test' }, 403, origin);
+  }
   if (channel === 'sms' && !profile.sms_opt_in) return reply({ error: 'Enable SMS updates in your profile first' }, 403, origin);
-  if (channel !== 'email' && !/^\\+[1-9]\\d{7,14}$/.test(normalizePhone(profile.phone))) return reply({ error: 'Enter a valid international phone number in your profile' }, 400, origin);
+  if (channel !== 'email' && !/^\+[1-9]\d{7,14}$/.test(normalizePhone(profile.phone))) return reply({ error: 'Enter a valid international phone number in your profile' }, 400, origin);
 
-  const { data: existing } = await admin.from('notification_log').select('id,status').eq('user_id', user.id).eq('channel', channel).eq('event_key', eventKey).maybeSingle();
+  const { data: existing, error: existingError } = await admin.from('notification_log').select('id,status').eq('user_id', user.id).eq('channel', channel).eq('event_key', eventKey).maybeSingle();
+  if (existingError) return reply({ error: 'Could not check notification history' }, 500, origin);
   if (existing && ['sent','delivered'].includes(existing.status)) return reply({ sent: true, duplicate: true }, 200, origin);
   if (existing && existing.status === 'queued') return reply({ sent: false, pending: true, duplicate: true }, 202, origin);
   const { count } = await admin.from('notification_log').select('id', { count: 'exact', head: true })
@@ -90,9 +103,26 @@ Deno.serve(async (req) => {
         const contentSid = Deno.env.get('TWILIO_WHATSAPP_CONTENT_SID');
         if (!contentSid) throw new Error('An approved WhatsApp template is not configured');
         form.set('ContentSid', contentSid);
-        form.set('ContentVariables', JSON.stringify({ '1': message }));
+        // Twilio's trial WhatsApp sender only accepts its preset template.
+        // Production approved templates receive the app's text in variable 1.
+        if (!whatsappSandboxMode) form.set('ContentVariables', JSON.stringify({ '1': message }));
       } else {
-        form.set('Body', message);
+        if ((Deno.env.get('TWILIO_SMS_TRIAL_MODE') ?? '').trim().toLowerCase() === 'true') {
+          // Twilio trial accounts accept only provider-defined SMS templates.
+          // Keep the profile delivery check useful in trial mode without
+          // pretending the candidate's custom job text was sent.
+          const trialBody = Deno.env.get('TWILIO_SMS_TRIAL_BODY') ?? 'sms_event_notifications';
+          const allowedTrialBodies = new Set([
+            'sms_2fa', 'sms_appointment_reminders', 'sms_order_confirmation',
+            'sms_delivery_updates', 'sms_customer_support', 'sms_marketing_promotions',
+            'sms_event_notifications', 'sms_account_alerts', 'sms_feedback_surveys',
+            'sms_internal_alerts',
+          ]);
+          if (!allowedTrialBodies.has(trialBody)) throw new Error('Invalid Twilio trial SMS template');
+          form.set('Body', trialBody);
+        } else {
+          form.set('Body', message);
+        }
         const entityId = Deno.env.get('TWILIO_SMS_DLT_ENTITY_ID');
         const templateId = Deno.env.get('TWILIO_SMS_DLT_TEMPLATE_ID');
         if (entityId) form.set('EntityId', entityId);
@@ -105,10 +135,20 @@ Deno.serve(async (req) => {
       });
       const result = await sent.json().catch(() => ({}));
       if (!sent.ok) {
-        await admin.from('notification_log').update({ status: 'failed', error_code: String(result.code ?? 'provider_rejected').slice(0, 80), updated_at: new Date().toISOString() }).eq('id', log.id);
-        return reply({ error: 'Messaging provider rejected the request' }, 502, origin);
+        const code = String(result.code ?? 'provider_rejected').slice(0, 80);
+        const description = String(result.message ?? '').slice(0, 240);
+        await admin.from('notification_log').update({ status: 'failed', error_code: code, updated_at: new Date().toISOString() }).eq('id', log.id);
+        return reply({ error: description ? `Twilio rejected the ${channel} message (${code}): ${description}` : `Twilio rejected the ${channel} message (${code})` }, 502, origin);
       }
-      await admin.from('notification_log').update({ status: 'sent', provider_message_id: result.sid ?? null, updated_at: new Date().toISOString() }).eq('id', log.id);
+      if (!result.sid) {
+        await admin.from('notification_log').update({ status: 'failed', error_code: 'provider_response_missing_sid', updated_at: new Date().toISOString() }).eq('id', log.id);
+        return reply({ error: 'Twilio accepted no trackable message ID; check Twilio message logs before retrying' }, 502, origin);
+      }
+      const recorded = await admin.from('notification_log').update({ status: 'sent', provider_message_id: result.sid, updated_at: new Date().toISOString() }).eq('id', log.id);
+      if (recorded.error) {
+        console.error('notify.message_accepted_but_log_update_failed', { code: recorded.error.code });
+        return reply({ sent: true, delivery_status: 'accepted', tracking: 'unavailable', message: 'Twilio accepted the message, but its delivery status could not be saved. Check Twilio message logs before retrying.' }, 200, origin);
+      }
     }
     return reply({ sent: true }, 200, origin);
   } catch (error) {

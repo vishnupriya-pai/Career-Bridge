@@ -10,7 +10,7 @@ const cors = (origin: string | null) => ({
 });
 const response = (body: unknown, status = 200, origin: string | null = null) =>
   new Response(JSON.stringify(body), { status, headers: { ...cors(origin), 'Content-Type': 'application/json' } });
-const cleanPhone = (value: string | null) => (value ?? '').replace(/[\\s()-]/g, '');
+const cleanPhone = (value: string | null) => (value ?? '').replace(/[\s()-]/g, '');
 type Channel = 'sms' | 'whatsapp';
 type Audience = 'all' | 'fresher' | 'experienced';
 
@@ -33,11 +33,14 @@ Deno.serve(async (req) => {
   try { input = await req.json(); } catch { return response({ error: 'Invalid request body' }, 400, origin); }
   const admin = createClient(url, service);
   const twilioConfigured = Boolean(Deno.env.get('TWILIO_ACCOUNT_SID') && Deno.env.get('TWILIO_AUTH_TOKEN'));
+  const smsTrialMode = (Deno.env.get('TWILIO_SMS_TRIAL_MODE') ?? '').toLowerCase() === 'true';
   const action = input.action;
 
   if (action === 'config') {
     return response({
-      sms: twilioConfigured && Boolean(Deno.env.get('TWILIO_SMS_FROM')),
+      sms: twilioConfigured && Boolean(Deno.env.get('TWILIO_SMS_FROM')) && !smsTrialMode,
+      smsTest: twilioConfigured && Boolean(Deno.env.get('TWILIO_SMS_FROM')) && smsTrialMode,
+      smsTrialMode,
       whatsapp: twilioConfigured && Boolean(Deno.env.get('TWILIO_WHATSAPP_FROM') && Deno.env.get('TWILIO_WHATSAPP_CONTENT_SID')),
       razorpay: Boolean(Deno.env.get('RAZORPAY_KEY_ID') && Deno.env.get('RAZORPAY_KEY_SECRET') && Deno.env.get('RAZORPAY_WEBHOOK_SECRET')),
       mode: (Deno.env.get('RAZORPAY_KEY_ID') ?? '').startsWith('rzp_live_') ? 'live' : 'test',
@@ -51,12 +54,13 @@ Deno.serve(async (req) => {
   }
 
   const getEligible = async (channel: Channel, audience: Audience) => {
-    let query = admin.from('profiles').select('id,phone,experience,whatsapp_opt_in,sms_opt_in,role').eq('role', 'candidate');
+    let query = admin.from('profiles').select('id,phone,phone_verified,experience,whatsapp_opt_in,sms_opt_in,role').eq('role', 'candidate');
     query = channel === 'whatsapp' ? query.eq('whatsapp_opt_in', true) : query.eq('sms_opt_in', true);
     const { data, error } = await query.not('phone', 'is', null).limit(1000);
     if (error) throw new Error('Could not select eligible recipients');
     const rows = (data ?? []).filter((row) => {
-      if (!/^\\+[1-9]\\d{7,14}$/.test(cleanPhone(row.phone))) return false;
+      if (!/^\+[1-9]\d{7,14}$/.test(cleanPhone(row.phone))) return false;
+      if (channel === 'whatsapp' && !row.phone_verified) return false;
       const fresher = (row.experience ?? '').toLowerCase().includes('fresh');
       return audience === 'all' || (audience === 'fresher' ? fresher : !fresher);
     });
@@ -69,6 +73,7 @@ Deno.serve(async (req) => {
     if (!['sms', 'whatsapp'].includes(channel) || !['all', 'fresher', 'experienced'].includes(audience)) {
       return response({ error: 'Choose a valid channel and audience' }, 400, origin);
     }
+    if (channel === 'sms' && smsTrialMode) return response({ error: 'Bulk SMS campaigns are unavailable in Twilio trial mode. Use the profile SMS delivery check to send a preset message to your own verified number.' }, 403, origin);
     try {
       const recipients = await getEligible(channel, audience);
       return response({ eligible: recipients.length, capped: recipients.length === 1000 }, 200, origin);
@@ -89,8 +94,9 @@ Deno.serve(async (req) => {
     if (!['sms', 'whatsapp'].includes(channel) || !['all', 'fresher', 'experienced'].includes(audience)) {
       return response({ error: 'Choose a valid channel and audience' }, 400, origin);
     }
-    if (!twilioConfigured || (channel === 'sms' && !Deno.env.get('TWILIO_SMS_FROM')) ||
-      (channel === 'whatsapp' && (!Deno.env.get('TWILIO_WHATSAPP_FROM') || !Deno.env.get('TWILIO_WHATSAPP_CONTENT_SID')))) {
+    if (channel === 'sms' && smsTrialMode) return response({ error: 'Bulk SMS campaigns are unavailable in Twilio trial mode. Use the profile SMS delivery check to send a preset message to your own verified number.' }, 403, origin);
+    if ((channel === 'sms' && (!twilioConfigured || !Deno.env.get('TWILIO_SMS_FROM'))) ||
+      (channel === 'whatsapp' && (!twilioConfigured || !Deno.env.get('TWILIO_WHATSAPP_FROM') || !Deno.env.get('TWILIO_WHATSAPP_CONTENT_SID')))) {
       return response({ error: 'The selected Twilio channel is not fully configured' }, 503, origin);
     }
     try {
@@ -119,7 +125,8 @@ Deno.serve(async (req) => {
     if (!/^[0-9a-f-]{36}$/i.test(campaignId)) return response({ error: 'A valid campaign is required' }, 400, origin);
     const { data: campaign, error } = await admin.from('notification_campaigns').select('*').eq('id', campaignId).maybeSingle();
     if (error || !campaign) return response({ error: 'Campaign not found' }, 404, origin);
-    if (!twilioConfigured) return response({ error: 'Twilio is not configured' }, 503, origin);
+    if (campaign.channel === 'sms' && smsTrialMode) return response({ error: 'This SMS campaign cannot be sent in Twilio trial mode. Use the profile SMS delivery check for a preset test message.' }, 403, origin);
+    if ((campaign.channel === 'sms' && !twilioConfigured) || (campaign.channel === 'whatsapp' && !twilioConfigured)) return response({ error: 'Twilio is not configured' }, 503, origin);
     if (action === 'launch') {
       if (campaign.status !== 'draft') return response({ error: 'Only a draft campaign can be launched' }, 409, origin);
       await admin.from('notification_campaigns').update({ status: 'sending', started_at: new Date().toISOString() }).eq('id', campaignId);
@@ -143,11 +150,11 @@ Deno.serve(async (req) => {
     let attempted = 0;
     for (const recipient of recipients ?? []) {
       attempted++;
-      const { data: profile } = await admin.from('profiles').select('phone,whatsapp_opt_in,sms_opt_in,role')
+      const { data: profile } = await admin.from('profiles').select('phone,phone_verified,whatsapp_opt_in,sms_opt_in,role')
         .eq('id', recipient.user_id).maybeSingle();
       const optedIn = campaign.channel === 'whatsapp' ? profile?.whatsapp_opt_in : profile?.sms_opt_in;
       const to = cleanPhone(profile?.phone ?? null);
-      if (!profile || profile.role !== 'candidate' || !optedIn || !/^\\+[1-9]\\d{7,14}$/.test(to)) {
+      if (!profile || profile.role !== 'candidate' || !optedIn || (campaign.channel === 'whatsapp' && !profile.phone_verified) || !/^\+[1-9]\d{7,14}$/.test(to)) {
         await admin.from('campaign_recipients').update({ status: 'suppressed', error_code: 'consent_or_phone_missing', updated_at: new Date().toISOString() }).eq('id', recipient.id);
         continue;
       }

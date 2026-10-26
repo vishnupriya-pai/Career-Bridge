@@ -106,11 +106,27 @@ export const getProfiles = async () => { if (!supabase)
     return read('cb_users', []); const { data, error } = await supabase.from('profiles').select('id,email,full_name,headline,location,role,created_at').order('created_at', { ascending: false }).limit(100); if (error)
     throw error; return data; };
 export const saveProfile = async (p) => { if (supabase) {
-    const { error } = await supabase.from('profiles').update({ full_name: p.full_name, phone: p.phone, whatsapp_opt_in: p.whatsapp_opt_in ?? false, sms_opt_in: p.sms_opt_in ?? false, headline: p.headline, location: p.location, experience: p.experience, skills: p.skills }).eq('id', p.id);
+    const { data: current, error: currentError } = await supabase.from('profiles').select('phone').eq('id', p.id).single();
+    if (currentError)
+        throw currentError;
+    const fields = { full_name: p.full_name, phone: p.phone, headline: p.headline, location: p.location, experience: p.experience, skills: p.skills };
+    const consent = { whatsapp_opt_in: p.whatsapp_opt_in ?? false, sms_opt_in: p.sms_opt_in ?? false };
+    if (current.phone !== p.phone) {
+        const { error } = await supabase.from('profiles').update({ ...fields, ...consent }).eq('id', p.id);
+        if (error)
+            throw error;
+        // Phone-change trigger clears old consent; this second update applies
+        // the user's freshly checked choices for the new number.
+        const { data, error: consentError } = await supabase.from('profiles').update(consent).eq('id', p.id).select('*').single();
+        if (consentError)
+            throw consentError;
+        return data;
+    }
+    const { data, error } = await supabase.from('profiles').update({ ...fields, ...consent }).eq('id', p.id).select('*').single();
     if (error)
         throw error;
-    return;
-} write('cb_profile', p); };
+    return data;
+} write('cb_profile', p); return p; };
 export const createJob = async (job) => { if (supabase) {
     const { error } = await supabase.from('jobs').insert(job);
     if (error)

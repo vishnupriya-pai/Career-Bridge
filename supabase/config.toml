@@ -25,3 +25,6 @@ verify_jwt = true
 
 [functions.messaging-webhooks]
 verify_jwt = false
+
+[functions.whatsapp-otp]
+verify_jwt = true

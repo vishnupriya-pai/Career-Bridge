@@ -38,18 +38,45 @@ Supabase Auth sends verification emails during sign-up. The sign-up flow request
 
 ### SMS and WhatsApp
 
-The `notify` Edge Function is deployed. Applications and referral requests send a confirmation email to the signed-in user's verified email, plus SMS and WhatsApp messages when the candidate has separately opted in to those channels. Messages are sent only after the database write succeeds. For local development, the deployed notify function allows http://localhost:5173 and http://localhost:5174; set APP_URL to the exact production origin. Configure Edge Function secrets: `APP_URL`, `RESEND_API_KEY`, `RESEND_FROM`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_SMS_FROM`, and `TWILIO_WHATSAPP_FROM`. For a personal demo without a verified domain, set `RESEND_FROM=onboarding@resend.dev` and use the same email address for the CareerBridge account as the Resend account owner; Resend restricts its shared test sender to that owner address. To send to other recipients, verify a sender domain with Resend and set `RESEND_FROM` to an address on that domain. Add a valid international-format phone number and save the separate optional SMS and WhatsApp consent choices in the profile before using those channels. The function sends only to the authenticated user's own profile contact and caps delivery at 15 messages per hour. Set TWILIO_WHATSAPP_CONTENT_SID to an approved Twilio WhatsApp template containing the variable {{1}}; the app inserts the notification text there. Business-initiated messages outside the 24-hour service window require an approved template. Twilio/Meta may require sender verification, opt-in, and production account access.
+The `notify` Edge Function is deployed. Applications and referral requests send a confirmation email to the signed-in user's verified email, plus SMS and WhatsApp messages when the candidate has separately opted in to those channels. Messages are sent only after the database write succeeds. For local development, the deployed notify function allows http://localhost:5173 and http://localhost:5174; set APP_URL to the exact production origin. Configure Edge Function secrets: `APP_URL`, `RESEND_API_KEY`, `RESEND_FROM`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_SMS_FROM`, `TWILIO_WHATSAPP_FROM`, and `TWILIO_VERIFY_SERVICE_SID`. For a personal demo without a verified domain, set `RESEND_FROM=onboarding@resend.dev` and use the same email address for the CareerBridge account as the Resend account owner; Resend restricts its shared test sender to that owner address. To send to other recipients, verify a sender domain with Resend and set `RESEND_FROM` to an address on that domain. Candidates save an E.164 phone number (for example `+919876543210`), opt in to WhatsApp job/application updates, and request a WhatsApp OTP from Profile. The `whatsapp-otp` function uses Twilio Verify with a WhatsApp-enabled Verify Service; the verified flag is server-managed and changing the phone number clears verification and WhatsApp consent. Only verified, opted-in candidates are eligible for WhatsApp campaigns. Admins can create and launch WhatsApp job-opportunity campaigns from Messaging; delivery is batched and asks for confirmation. The `notify` function sends only to the authenticated user's own profile contact and caps delivery at 15 messages per hour. Set TWILIO_WHATSAPP_CONTENT_SID to an approved Twilio WhatsApp template containing the variable {{1}}; the app inserts the notification text there. Business-initiated messages outside the 24-hour service window require an approved template. Twilio/Meta may require sender verification, opt-in, and production account access.
+
+For a Twilio SMS trial, set `TWILIO_SMS_TRIAL_MODE=true`, `TWILIO_SMS_TRIAL_BODY=sms_event_notifications` (or another supported Twilio trial template name), and `TWILIO_SMS_FROM` to the sender shown in the trial SMS API request. The Profile → Delivery check sends that preset generic message to the signed-in user's own opted-in number; the custom message is ignored in trial mode. Trial SMS campaigns are disabled because Twilio only permits delivery to individually verified recipient numbers. After upgrading, turn off trial mode to send custom message bodies. Twilio trial SMS is limited to verified recipients and provider-defined message templates; check Twilio Console for the sender assigned to the specific recipient.
+
+To enable the Profile delivery checks on a deployed project, apply all migrations (including `20261025054100_add_sms_opt_in.sql`, `20261025120000_whatsapp_phone_verification.sql`, and `20261026100000_reset_message_consent_on_phone_change.sql`), then deploy the latest `notify`, `whatsapp-otp`, `messaging-admin`, `messaging-webhooks`, and `payments` Edge Functions. Add these secrets under Supabase → Edge Functions → Secrets: `APP_URL` (exact website origin), `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_SMS_FROM`, `TWILIO_WHATSAPP_FROM` (format `whatsapp:+...`), `TWILIO_WHATSAPP_CONTENT_SID` (approved Content template with a `{{1}}` body variable), and `TWILIO_VERIFY_SERVICE_SID` (WhatsApp enabled). Never put provider credentials in frontend `VITE_` variables. In the app, save the international phone and the separate SMS/WhatsApp opt-ins. For WhatsApp, complete the one-time OTP verification above Delivery check, then press WhatsApp. Twilio trial SMS only reaches verified recipient numbers. A `200`/success response means Twilio accepted the send request; use Twilio Messaging Logs and the message status callback to confirm carrier delivery and diagnose failures.
+
+For a Twilio WhatsApp trial sender, set `TWILIO_WHATSAPP_SANDBOX_MODE=true`, use the `From` sender and preset `ContentSid` shown in Twilio's Try out WhatsApp API request, and have the receiving phone join/verify that Twilio trial flow. This trial flag skips the Verify Service check only for the signed-in user's own message delivery check and uses the provider's preset content without app variables. It does not enable bulk campaigns or production WhatsApp sending. Turn the flag off after connecting an approved production sender/template.
 
 ### Incoming WhatsApp messages
 
 The AI chatbot is disabled. CareerBridge uses WhatsApp and SMS for opted-in, outbound application and referral confirmations; incoming customer messages do not receive automated AI replies.
 
-### Razorpay payments
+### Razorpay demo payments
 
-The `payments` Edge Function is deployed. Set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`, `PLAN_PRICE_PAISE` (default `49900`), and `APP_URL` as Edge Function secrets. Configure a Razorpay webhook to `https://<project-ref>.supabase.co/functions/v1/payments` with event types `payment.captured`, `payment.failed`, and `order.paid`. Add the same webhook secret in Razorpay and Supabase. The browser requests an order from the server; a signed webhook is the source of truth for paid status. Do not grant clients direct write access to `payment_orders`. Use Razorpay test keys before switching to live credentials. The Plus offer is currently a one-time ₹499 checkout; connect confirmed payments to the product entitlement or receipt workflow you intend to offer before charging real users.
+Candidates can use the fixed ₹499.00 CareerBridge Plus demo checkout. It is labeled **DEMO — TEST PAYMENTS ONLY** and refuses to run unless `RAZORPAY_MODE=test` and the server key ID starts with `rzp_test_`. The server creates each order and verifies the Checkout signature plus Razorpay's order, amount, currency, and captured status. A captured payment becomes `awaiting_admin`; it is not marked paid yet. An administrator can confirm it in Admin → Recent payment events. The server rechecks the captured payment with Razorpay, records the administrator and timestamp, then sends one confirmation email through Resend. Admins can retry the email if Resend fails. Duplicate payment callbacks and confirmations do not send duplicate emails. The Razorpay secret stays in Supabase Edge Function secrets.
 
-For a future code update, deploy functions with the Supabase CLI after linking the project, for example `supabase functions deploy notify`, `supabase functions deploy payments`, and `supabase functions deploy admin-users`. Set secrets with `supabase secrets set NAME=value`; do not commit them. The functions validate authenticated users, keep provider secrets server-side, return sanitized provider errors, and apply a per-user request limit. The `admin-users` function checks the caller’s trusted administrator claim before changing a user role. Configure function CORS to the deployed app's exact origin using `APP_URL`.
+**No payment credentials are included.** Add these values as Supabase Edge Function secrets for a deployed function, or in ignored `supabase/functions/.env` for local function serving:
 
+- `RAZORPAY_MODE=test`
+- `RAZORPAY_KEY_ID` (must be your Razorpay **Test Mode** key beginning `rzp_test_`)
+- `RAZORPAY_KEY_SECRET` (test-mode secret)
+- `RAZORPAY_WEBHOOK_SECRET` (the secret configured for the test-mode webhook)
+- `APP_URL` (the allowed web-app origin)
+
+The plan amount is fixed server-side at 49,900 paise; it is not read from the client or configurable as a live amount. Apply `20261026130000_admin_payment_confirmation.sql` so captured orders can wait for administrator review. Set `RESEND_API_KEY` and `RESEND_FROM` as Edge Function secrets for the post-approval customer email; the customer's email address must be verified with Supabase Auth.
+
+For the hosted Supabase project, apply pending migrations with `supabase db push`, then deploy the updated function with `supabase functions deploy payments`. The existing website must use that same Supabase project. Razorpay checkout stays unavailable until test credentials are set in that project's Edge Function Secrets.
+
+For a local end-to-end test, install the Supabase CLI and Docker Desktop, then run these in the project folder:
+
+```powershell
+npx supabase start
+npx supabase db reset
+npx supabase functions serve payments --env-file supabase/functions/.env
+```
+
+Create the ignored `supabase/functions/.env` file with the test secrets above. In `supabase status`, copy the local API URL and publishable/anon key into the ignored root `.env.local` as `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`. Start Vite in a second terminal with `npm run dev`. Sign in with a candidate account, open Profile → CareerBridge Plus demo checkout, and use only Razorpay's test payment values from [Razorpay Test Mode documentation](https://razorpay.com/docs/server-integration/python/test-app/). After a test payment is captured, sign in as an administrator and confirm it under Admin → Recent payment events; only then does the server mark it paid and send the confirmation email. A failed email is visible to the administrator and can be retried. Never enter real card, bank, UPI, or other payment details. For local Edge Function secret handling, see [Supabase Environment Variables documentation](https://supabase.com/docs/guides/functions/secrets).
+
+The updated Edge Function source is **not deployed**. The current hosted function will not pick up these changes until you explicitly authorize a deployment. Do not switch credentials to Live mode or deploy this function as part of the current change.
 ## Environment variables
 
 | Variable | Where | Purpose |
@@ -61,9 +88,10 @@ For a future code update, deploy functions with the Supabase CLI after linking t
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` | Edge Functions | SMS and WhatsApp delivery |
 | `TWILIO_SMS_FROM`, `TWILIO_WHATSAPP_FROM` | Edge Functions | Provider-approved sender IDs |
 | `TWILIO_WHATSAPP_CONTENT_SID` | Edge Functions | Approved WhatsApp template Content SID (HX...) with variable {{1}} |
-| `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | Edge Functions | Create checkout orders |
+| `TWILIO_VERIFY_SERVICE_SID` | Edge Functions | Twilio Verify Service SID with WhatsApp channel enabled, for phone OTP checks |
+| `RAZORPAY_MODE`, `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET` | Edge Functions | Require Razorpay test mode and create test orders |
 | `RAZORPAY_WEBHOOK_SECRET` | Edge Functions | Verify Razorpay webhook HMAC |
-| `PLAN_PRICE_PAISE` | Edge Functions | Checkout amount in paise (default 49900) |
+
 
 ## Architecture and security
 
@@ -91,7 +119,7 @@ Build with `npm run build` and deploy `dist/` to a static host such as Vercel, N
 - [ ] Add Supabase project URL and publishable key, apply the migration, and provision trusted staff accounts.
 - [ ] Configure production SMTP and test email verification/redirects.
 - [ ] Add Resend and Twilio credentials, SMS-capable sender, WhatsApp sender/template, and candidate channel opt-ins.
-- [ ] Add Razorpay test credentials, webhook secret and URL; decide how confirmed payments grant the advertised Plus entitlement.
+- [ ] Add Razorpay test credentials and configure a test-mode webhook. Live payments and the Plus entitlement are out of scope for this demo.
 - [ ] Set a production `APP_URL`, production auth redirect allow-list, privacy/terms pages, and deployment domain.
 
-Provider delivery and live checkout still require valid Resend/Twilio/Razorpay credentials. Resend's test sender may only deliver to the account owner's verified address; external recipients require a verified sender domain.
+Real customer messaging still needs valid Resend/Twilio credentials. Razorpay Live mode is deliberately disabled in this demo. Resend's test sender may only deliver to the account owner's verified address; external recipients require a verified sender domain.
