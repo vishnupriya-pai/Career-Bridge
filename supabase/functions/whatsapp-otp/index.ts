@@ -1,7 +1,7 @@
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.57.4';
+import { createClient } from 'npm:@supabase/supabase-js@2.57.4';
 
 const appOrigin = Deno.env.get('APP_URL') ?? 'http://localhost:5173';
-const allowedOrigins = new Set([appOrigin, 'http://localhost:5173', 'http://localhost:5174']);
+const allowedOrigins = new Set([appOrigin, 'http://localhost:5173', 'http://localhost:5174', 'http://127.0.0.1:5173', 'http://127.0.0.1:5174']);
 const corsFor = (origin: string | null) => ({
   'Access-Control-Allow-Origin': origin && allowedOrigins.has(origin) ? origin : appOrigin,
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',

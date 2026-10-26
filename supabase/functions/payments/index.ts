@@ -2,19 +2,33 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.57.4';
 
 const appOrigin = Deno.env.get('APP_URL') ?? 'http://localhost:5173';
-const cors = { 'Access-Control-Allow-Origin': appOrigin, 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-razorpay-signature, x-razorpay-event-id', 'Access-Control-Allow-Methods': 'POST, OPTIONS' };
+const allowedOrigins = new Set([appOrigin, 'http://localhost:5173', 'http://localhost:5174', 'http://127.0.0.1:5173', 'http://127.0.0.1:5174']);
+const cors = { 'Access-Control-Allow-Origin': appOrigin, 'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-razorpay-signature, x-razorpay-event-id, x-region, x-supabase-api-version, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Private-Network': 'true', 'Access-Control-Max-Age': '86400', 'Vary': 'Origin, Access-Control-Request-Headers' };
 const out = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...cors, 'Content-Type': 'application/json' } });
+function corsPreflight(req: Request) {
+  const origin = req.headers.get('origin');
+  const requestedHeaders = req.headers.get('access-control-request-headers');
+  const headers: Record<string, string> = { ...cors, 'Access-Control-Allow-Origin': origin && allowedOrigins.has(origin) ? origin : appOrigin, 'Access-Control-Allow-Headers': requestedHeaders || cors['Access-Control-Allow-Headers'], 'Vary': 'Origin, Access-Control-Request-Headers' };
+  if (req.headers.get('access-control-request-private-network') === 'true') headers['Access-Control-Allow-Private-Network'] = 'true';
+  return new Response('ok', { headers });
+}
 const hex = (bytes: ArrayBuffer) => Array.from(new Uint8Array(bytes)).map((b) => b.toString(16).padStart(2, '0')).join('');
 const equal = (a: string, b: string) => { if (a.length !== b.length) return false; let result = 0; for (let i = 0; i < a.length; i++) result |= a.charCodeAt(i) ^ b.charCodeAt(i); return result === 0; };
 async function hmac(secret: string, value: string) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   return hex(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(value)));
 }
+async function razorpayRequest(path: string, method: string, keyId: string, keySecret: string, payload?: unknown) {
+  const response = await fetch('https://api.razorpay.com/v1/' + path, { method, headers: { Authorization: 'Basic ' + btoa(keyId + ':' + keySecret), 'Content-Type': 'application/json' }, ...(payload ? { body: JSON.stringify(payload) } : {}) });
+  const data = await response.json().catch(() => ({}));
+  return { response, data };
+}
 async function sendPaymentNotice(order: any, paymentId: string, admin: any, appUrl: string) {
   const { data: profile } = await admin.from('profiles').select('id,email,full_name,phone,phone_verified,sms_opt_in,whatsapp_opt_in').eq('id', order.user_id).maybeSingle();
   if (!profile) return { sent: false, error: 'The customer profile could not be found.' };
   const subject = 'Payment received · CareerBridge';
-  const message = 'Hi ' + (profile.full_name || 'there') + ', your CareerBridge payment of ₹' + (Number(order.amount_paise) / 100).toFixed(2) + ' has been confirmed. Payment reference: ' + paymentId + '.';
+  const planName = order.plan_name || 'CareerBridge Plus';
+  const message = 'Hi ' + (profile.full_name || 'there') + ', your ' + planName + ' one-time payment of ₹' + (Number(order.amount_paise) / 100).toFixed(2) + ' has been confirmed by CareerBridge. Payment reference: ' + paymentId + '.';
   const eventKey = 'payment:' + paymentId + ':email';
   const service = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
   if (!profile.email) return { sent: false, error: 'The customer has no email address on their profile.' };
@@ -51,7 +65,10 @@ async function sendPaymentNotice(order: any, paymentId: string, admin: any, appU
 }
 
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
+  const requestOrigin = req.headers.get('origin') ?? '';
+  const out = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...cors, 'Access-Control-Allow-Origin': allowedOrigins.has(requestOrigin) ? requestOrigin : appOrigin, 'Content-Type': 'application/json' } });
+  try {
+  if (req.method === 'OPTIONS') return corsPreflight(req);
   if (req.method !== 'POST') return out({ error: 'Method not allowed' }, 405);
   const raw = await req.text();
   let body: any;
@@ -60,9 +77,8 @@ Deno.serve(async (req) => {
   const service = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
   const admin = createClient(url, service);
   const testKeyId = Deno.env.get('RAZORPAY_KEY_ID');
-  if (Deno.env.get('RAZORPAY_MODE') !== 'test' || !testKeyId?.startsWith('rzp_test_')) {
-    return out({ error: 'Payments are disabled unless Razorpay test mode is configured with an rzp_test_ API key.' }, 503);
-  }
+  if (Deno.env.get('RAZORPAY_MODE') !== 'test') return out({ error: 'RAZORPAY_MODE must be set to exactly test in Supabase Edge Function secrets.' }, 503);
+  if (!testKeyId?.startsWith('rzp_test_')) return out({ error: 'RAZORPAY_KEY_ID must be a Test Mode Key ID starting with rzp_test_. Check that the Key ID, not the Key Secret, is stored under RAZORPAY_KEY_ID.' }, 503);
 
   if (req.headers.has('x-razorpay-signature') || body.action === 'webhook') {
     const secret = Deno.env.get('RAZORPAY_WEBHOOK_SECRET');
@@ -75,6 +91,8 @@ Deno.serve(async (req) => {
     const eventId = req.headers.get('x-razorpay-event-id') ?? hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw)));
     const payment = event.payload?.payment?.entity;
     const orderEntity = event.payload?.order?.entity;
+    const providerSubscription = event.payload?.subscription?.entity;
+    const providerSubscriptionId = payment?.subscription_id ?? providerSubscription?.id ?? null;
     const providerOrderId = payment?.order_id ?? orderEntity?.id ?? null;
     const paymentId = payment?.id ?? null;
     const digest = hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw)));
@@ -86,7 +104,7 @@ Deno.serve(async (req) => {
     const { data: savedEvent } = await admin.from('payment_events').select('processed_at').eq('provider_event_id', eventId).maybeSingle();
     if (savedEvent?.processed_at) return out({ received: true, duplicate: true });
 
-    if (['payment.captured','order.paid','payment.failed','refund.processed','payment.refunded'].includes(eventType)) {
+    if (['payment.captured','order.paid','payment.failed','refund.processed','payment.refunded'].includes(eventType) && !providerSubscriptionId) {
       if (!providerOrderId) return out({ error: 'Event has no associated order' }, 400);
       const { data: order } = await admin.from('payment_orders').select('*').eq('provider', 'razorpay').eq('provider_order_id', providerOrderId).maybeSingle();
       if (!order) return out({ error: 'Payment order not found' }, 404);
@@ -143,7 +161,10 @@ Deno.serve(async (req) => {
       const providerData = await providerResponse.json();
       const providerPayment = order.provider_payment_id ? providerData : (providerData.items ?? []).find((item: any) => item.order_id === order.provider_order_id && item.status === 'captured' && Number(item.amount) === Number(order.amount_paise) && item.currency === order.currency);
       if (!providerPayment) return out({ error: 'Razorpay has not captured a matching payment for this order yet.' }, 409);
-      if (providerPayment.order_id !== order.provider_order_id || Number(providerPayment.amount) !== Number(order.amount_paise) || providerPayment.currency !== order.currency) {
+      const providerMatches = order.provider_subscription_id
+        ? providerPayment.subscription_id === order.provider_subscription_id && Number(providerPayment.amount) === Number(order.amount_paise) && providerPayment.currency === order.currency
+        : providerPayment.order_id === order.provider_order_id && Number(providerPayment.amount) === Number(order.amount_paise) && providerPayment.currency === order.currency;
+      if (!providerMatches) {
         await admin.from('audit_logs').insert({ actor_id: user.id, action: 'payment.admin_confirmation_mismatch', entity_type: 'payment_order', entity_id: order.id });
         return out({ error: 'Razorpay payment details do not match this order.' }, 409);
       }
@@ -156,6 +177,17 @@ Deno.serve(async (req) => {
         const { data: current } = await admin.from('payment_orders').select('*').eq('id', order.id).maybeSingle();
         if (current?.status !== 'paid') return out({ error: 'The payment changed before it could be confirmed. Refresh and try again.' }, 409);
       }
+      const { data: existingSubscription, error: subscriptionLookupError } = await admin.from('user_subscriptions').select('id').eq('payment_order_id', order.id).maybeSingle();
+      if (subscriptionLookupError) return out({ error: 'The payment is confirmed, but the membership record could not be checked.' }, 500);
+      if (!order.provider_subscription_id && !existingSubscription && Number(order.plan_duration_days ?? 30) > 0) {
+        const startedAt = new Date();
+        const expiresAt = new Date(startedAt.getTime() + Number(order.plan_duration_days ?? 30) * 86400000);
+        const { error: subscriptionError } = await admin.from('user_subscriptions').insert({
+          user_id: order.user_id, plan_id: order.plan_id, plan_name: order.plan_name || 'CareerBridge Plus',
+          payment_order_id: order.id, status: 'active', started_at: startedAt.toISOString(), expires_at: expiresAt.toISOString(),
+        });
+        if (subscriptionError) return out({ error: 'The payment is confirmed, but the membership could not be activated.' }, 500);
+      }
       const { error: auditError } = await admin.from('audit_logs').insert({ actor_id: user.id, action: 'payment.admin_confirmed', entity_type: 'payment_order', entity_id: order.id, details: { provider_payment_id: providerPayment.id } });
       if (auditError) console.error('payment.audit_log_failed', { order_id: order.id });
     }
@@ -164,6 +196,25 @@ Deno.serve(async (req) => {
     if (!paymentId) return out({ confirmed: true, status: 'paid', emailSent: false, error: 'The payment is confirmed, but no payment reference is available to send the email.' });
     const email = await sendPaymentNotice(order, paymentId, admin, Deno.env.get('APP_URL') ?? '');
     return out({ confirmed: true, status: 'paid', emailSent: email.sent, emailPending: email.pending ?? false, error: email.sent ? undefined : email.error });
+  }
+  if (body.action === 'admin_save_plan') {
+    if (user.app_metadata?.role !== 'admin') return out({ error: 'Administrator access required' }, 403);
+    const name = String(body.name ?? '').trim();
+    const description = String(body.description ?? '').trim();
+    const amount = Math.round(Number(body.amount) * 100);
+    const features = Array.isArray(body.features) ? body.features.map((feature: unknown) => String(feature).trim()).filter(Boolean) : [];
+    if (String(body.id ?? 'careerbridge-plus') !== 'careerbridge-plus') return out({ error: 'Only the CareerBridge Plus payment option can be edited.' }, 400);
+    if (name.length < 2 || name.length > 80 || description.length > 300 || !Number.isSafeInteger(amount) || amount < 100 || amount > 100000000) return out({ error: 'Enter a valid plan name, description, and one-time price.' }, 400);
+    if (features.length > 8 || features.some((feature: string) => feature.length > 120)) return out({ error: 'Add up to 8 benefits of 120 characters each.' }, 400);
+    const { data: savedPlan, error: saveError } = await admin.from('subscription_plans').upsert({
+      id: 'careerbridge-plus', name, description, amount_paise: amount, currency: 'INR', billing_period: 'monthly',
+      billing_interval: 1, total_cycles: 1, features, active: body.active !== false,
+      sort_order: Number.isSafeInteger(Number(body.sort_order)) ? Number(body.sort_order) : 1,
+      updated_at: new Date().toISOString(),
+    }).select('*').single();
+    if (saveError) return out({ error: 'The CareerBridge Plus payment option could not be saved.' }, 500);
+    await admin.from('audit_logs').insert({ actor_id: user.id, action: 'payment_option.saved', entity_type: 'subscription_plan', entity_id: 'careerbridge-plus', details: { amount_paise: amount, active: body.active !== false } });
+    return out({ plan: savedPlan });
   }
   if (body.action === 'verify_checkout') {
     const orderId = String(body.razorpay_order_id ?? '');
@@ -199,18 +250,30 @@ Deno.serve(async (req) => {
   if (body.action !== 'create_order') return out({ error: 'Unsupported action' }, 400);
   const keyId = Deno.env.get('RAZORPAY_KEY_ID'), keySecret = Deno.env.get('RAZORPAY_KEY_SECRET');
   if (!keyId || !keySecret) return out({ error: 'Razorpay is not configured' }, 503);
-  const amount = 49900; // Fixed demo price: INR 499.00; never client controlled.
-  if (!Number.isSafeInteger(amount) || amount < 100) return out({ error: 'Invalid plan price' }, 500);
+  const { data: plan, error: planError } = await admin.from('subscription_plans').select('id,name,amount_paise,currency,active').eq('id', 'careerbridge-plus').eq('active', true).maybeSingle();
+  if (planError || !plan) return out({ error: 'That subscription plan is unavailable. Refresh the page and try again.' }, 404);
+  const amount = Number(plan.amount_paise);
+  const durationDays = 30;
+  if (!Number.isSafeInteger(amount) || amount < 100 || plan.currency !== 'INR') return out({ error: 'This plan is not currently available for online payment.' }, 400);
   const { count } = await admin.from('payment_orders').select('id', { count: 'exact', head: true }).eq('user_id', user.id).gte('created_at', new Date(Date.now() - 60 * 60 * 1000).toISOString());
   if ((count ?? 0) >= 5) return out({ error: 'Order limit reached. Try again later.' }, 429);
   const created = await fetch('https://api.razorpay.com/v1/orders', {
     method: 'POST', headers: { Authorization: 'Basic ' + btoa(keyId + ':' + keySecret), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ amount, currency: 'INR', receipt: 'cb_' + crypto.randomUUID().replaceAll('-', '').slice(0, 20), notes: { product: 'CareerBridge Plus demo', mode: 'test' } }),
+    body: JSON.stringify({ amount, currency: plan.currency, receipt: 'cb_' + crypto.randomUUID().replaceAll('-', '').slice(0, 20), notes: { product: plan.name, plan_id: plan.id, mode: 'test' } }),
   });
-  if (!created.ok) return out({ error: 'Payment provider could not create an order' }, 502);
+  if (!created.ok) {
+    const providerError = await created.json().catch(() => ({}));
+    const providerCode = String(providerError?.error?.code ?? 'UNKNOWN').slice(0, 80);
+    const providerDescription = String(providerError?.error?.description ?? 'No further details were returned.').replace(/[\r\n]/g, ' ').slice(0, 240);
+    console.error('razorpay.order.create_failed', { status: created.status, code: providerCode, description: providerDescription });
+    return out({ error: 'Razorpay rejected the order (' + providerCode + '): ' + providerDescription }, 502);
+  }
   const providerOrder = await created.json();
-  const { error: savedError } = await admin.from('payment_orders').insert({ user_id: user.id, provider: 'razorpay', provider_order_id: providerOrder.id, amount_paise: amount, currency: 'INR', status: 'created' });
+  const { error: savedError } = await admin.from('payment_orders').insert({ user_id: user.id, provider: 'razorpay', provider_order_id: providerOrder.id, amount_paise: amount, currency: plan.currency, status: 'created', plan_id: plan.id, plan_name: plan.name, plan_duration_days: durationDays });
   if (savedError) return out({ error: 'Order could not be saved' }, 500);
-  return out({ order_id: providerOrder.id, amount: providerOrder.amount, currency: providerOrder.currency, key_id: keyId, name: 'CareerBridge', description: 'CareerBridge Plus demo · TEST PAYMENT ONLY', mode: 'test' });
+  return out({ order_id: providerOrder.id, amount: providerOrder.amount, currency: providerOrder.currency, key_id: keyId, name: 'CareerBridge', description: plan.name + ' · one-time payment · TEST PAYMENT ONLY', plan_name: plan.name, duration_days: durationDays, mode: 'test' });
+  } catch (error) {
+    console.error('payments.unhandled_error', { name: error instanceof Error ? error.name : 'UnknownError' });
+    return out({ error: 'The payment function encountered an internal error. Retry once; if it repeats, share this message with the administrator.' }, 500);
+  }
 });
-

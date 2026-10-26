@@ -105,6 +105,23 @@ export const getProfile = async (id, email) => { if (supabase) {
 export const getProfiles = async () => { if (!supabase)
     return read('cb_users', []); const { data, error } = await supabase.from('profiles').select('id,email,full_name,headline,location,role,created_at').order('created_at', { ascending: false }).limit(100); if (error)
     throw error; return data; };
+export const getAdminDashboardCounts = async () => {
+    if (!supabase) {
+        const users = read('cb_users', []);
+        return {
+            candidates: users.filter(user => user.role === 'candidate').length,
+            coordinators: users.filter(user => user.role === 'coordinator').length,
+            admins: users.filter(user => user.role === 'admin').length
+        };
+    }
+    const countRole = async role => {
+        const { count, error } = await supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('role', role);
+        if (error) throw error;
+        return count ?? 0;
+    };
+    const [candidates, coordinators, admins] = await Promise.all([countRole('candidate'), countRole('coordinator'), countRole('admin')]);
+    return { candidates, coordinators, admins };
+};
 export const saveProfile = async (p) => { if (supabase) {
     const { data: current, error: currentError } = await supabase.from('profiles').select('phone').eq('id', p.id).single();
     if (currentError)

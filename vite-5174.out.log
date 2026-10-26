@@ -1,0 +1,11 @@
+
+> careerbridge-job-portal@1.0.0 dev
+> vite --host 0.0.0.0 --port 5174 --strictPort
+
+
+  VITE v8.3.5  ready in 426 ms
+
+  ➜  Local:   http://localhost:5174/
+  ➜  Network: http://192.168.56.1:5174/   Ethernet 2
+  ➜  Network: http://10.175.33.190:5174/  Wi-Fi
+  ➜  press h + enter to show help

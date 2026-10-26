@@ -28,3 +28,6 @@ verify_jwt = false
 
 [functions.whatsapp-otp]
 verify_jwt = true
+
+[functions.career-chat]
+verify_jwt = true
